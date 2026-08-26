@@ -5,6 +5,7 @@ import {
 	clearCachedModule,
 	defaultLoaders,
 	loadDefaultPiSessionApi,
+	resolvePiCodingAgentModule,
 	type ModuleLoader,
 } from "./pi-session-api";
 
@@ -89,7 +90,8 @@ describe("loadDefaultPiSessionApi", () => {
 			);
 			writeFileSync(
 				join(pkgRoot, "index.js"),
-				`export const SessionManager = { listAll: async () => [] };\n`,
+				`export const __piShimFakeMarker = "fake-9.9.9";\n` +
+					`export const SessionManager = { listAll: async () => [] };\n`,
 			);
 			// bin shim: bin/pi -> <pkgRoot>/index.js (a symlink to the real entry)
 			const binDir = join(dir, "bin");
@@ -108,6 +110,18 @@ describe("loadDefaultPiSessionApi", () => {
 				clearCachedModule();
 				const api = await loadDefaultPiSessionApi();
 				expect(typeof api.listSessions).toBe("function");
+				expect(typeof api.loadEntriesFromFile).toBe("function");
+				// The fake copy exports a marker the real installed pi-coding-agent
+				// does not. Asserting it proves the symlink walk actually resolved
+				// the fake copy: if the walk broke, resolvePiCodingAgentModule would
+				// silently fall back to the installed package (whose listAll is also
+				// a function) and the function checks above would still pass — the
+				// exact regression this test guards against. The marker makes that
+				// fallback fail loudly instead.
+				const mod = (await resolvePiCodingAgentModule(defaultLoaders)) as {
+					__piShimFakeMarker?: string;
+				};
+				expect(mod.__piShimFakeMarker).toBe("fake-9.9.9");
 				expect(realpathSync(shim)).toBe(join(pkgRoot, "index.js"));
 			} finally {
 				Object.defineProperty(process, "argv", {
@@ -189,6 +203,38 @@ describe("loadDefaultPiSessionApi", () => {
 			expect(error?.message).toContain(
 				"symlinked or nonstandard install layout",
 			);
+		});
+
+		it("missing argv[1] names the walked entry (execPath) in the error, not undefined", async () => {
+			const origArgv = process.argv;
+			try {
+				// Packaged-binary run: argv has no script path, so the loader falls
+				// back to process.execPath; the upward walk cannot find
+				// pi-coding-agent from there, and the error must name the path
+				// actually walked rather than interpolating `undefined`.
+				Object.defineProperty(process, "argv", {
+					value: [process.execPath],
+					configurable: true,
+				});
+				const loaders: ModuleLoader[] = [defaultLoaders[0]];
+				let error: Error | null = null;
+				try {
+					await loadDefaultPiSessionApi(loaders);
+				} catch (e: unknown) {
+					error = e as Error;
+				}
+				expect(error).not.toBeNull();
+				expect(error?.message).toContain(
+					"Could not locate @earendil-works/pi-coding-agent package.json from",
+				);
+				expect(error?.message).toContain(process.execPath);
+				expect(error?.message).not.toContain("from undefined");
+			} finally {
+				Object.defineProperty(process, "argv", {
+					value: origArgv,
+					configurable: true,
+				});
+			}
 		});
 
 		it("memoization: two calls -> loaders invoked once", async () => {

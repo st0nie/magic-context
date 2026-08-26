@@ -73,8 +73,12 @@ export const defaultLoaders: ModuleLoader[] = [
 				dir = dirname(dir);
 			}
 			if (!found) {
+				// Use the resolved `entry` (which may have fallen back to
+				// process.execPath when argv[1] is a CLI arg or absent), not
+				// process.argv[1], so the message names the path actually walked
+				// instead of interpolating `undefined`.
 				throw new Error(
-					`Could not locate ${PI_CODING_AGENT_MODULE} package.json from ${process.argv[1]}`,
+					`Could not locate ${PI_CODING_AGENT_MODULE} package.json from ${entry}`,
 				);
 			}
 			const pkg = found.pkg as {
