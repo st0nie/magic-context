@@ -1,5 +1,5 @@
-import { readFileSync } from "node:fs";
-import { createRequire } from "node:module";
+import { existsSync, readFileSync, realpathSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
 
 /**
@@ -28,19 +28,70 @@ export interface ModuleLoader {
 
 export const defaultLoaders: ModuleLoader[] = [
 	{
-		name: "Bare import",
-		load: async () => await import(/* @vite-ignore */ PI_CODING_AGENT_MODULE),
-	},
-	{
+		// Resolve from the running Pi binary FIRST so the dreamer loads the SAME
+		// pi-coding-agent version that owns the live session format. A stale or
+		// mismatched copy in an extension tree (e.g. a host peer that was
+		// auto-installed once and never updated) can drift from the live session
+		// API and break retrospective / refresh-primers.
 		name: "Resolve from running Pi binary entry",
 		load: async () => {
-			if (!process.argv[1]) {
-				throw new Error("process.argv[1] is undefined");
+			if (!process.argv[1] && !process.execPath) {
+				throw new Error(
+					"Neither process.argv[1] nor process.execPath is available",
+				);
 			}
-			const require = createRequire(process.argv[1]);
-			const resolved = require.resolve(PI_CODING_AGENT_MODULE);
-			return await import(pathToFileURL(resolved).href);
+			// The Pi binary is spawned with `process.argv[1]` pointing at the host
+			// `cli.js` (see subagent-runner resolvePiInvocation). But in a
+			// packaged/single-file binary run, argv[1] is a CLI arg (e.g. `--print`),
+			// and when Pi is launched via a bin shim, argv[1] may be a SYMLINK to the
+			// real cli.js (node/bun preserve the invocation path). So resolve the real
+			// entry first (realpathSync), then fall back to the interpreter binary
+			// (process.execPath) when argv[1] is not an on-disk file at all.
+			const entry =
+				process.argv[1] && existsSync(process.argv[1])
+					? realpathSync(process.argv[1])
+					: process.execPath;
+			// pi-coding-agent ships ESM-only exports (no "require" condition), so
+			// createRequire(...).resolve("<pkg>") fails with
+			// ERR_PACKAGE_PATH_NOT_EXPORTED. Walk up from the resolved entry to find
+			// the package by name and import its ESM entry directly.
+			let dir = dirname(entry);
+			let found: { dir: string; pkg: Record<string, unknown> } | null = null;
+			while (dir !== dirname(dir)) {
+				const pkgJsonPath = join(dir, "package.json");
+				if (existsSync(pkgJsonPath)) {
+					try {
+						const pkg = JSON.parse(readFileSync(pkgJsonPath, "utf8"));
+						if (pkg?.name === PI_CODING_AGENT_MODULE) {
+							found = { dir, pkg };
+							break;
+						}
+					} catch {
+						// ignore unreadable/invalid package.json
+					}
+				}
+				dir = dirname(dir);
+			}
+			if (!found) {
+				throw new Error(
+					`Could not locate ${PI_CODING_AGENT_MODULE} package.json from ${process.argv[1]}`,
+				);
+			}
+			const pkg = found.pkg as {
+				exports?: { ".": { import?: string } } | undefined;
+				module?: string;
+				main?: string;
+			};
+			const entryRel = pkg.exports?.["."]?.import ?? pkg.module ?? pkg.main;
+			if (!entryRel) {
+				throw new Error(`No ESM entry found in ${found.dir}/package.json`);
+			}
+			return await import(pathToFileURL(join(found.dir, entryRel)).href);
 		},
+	},
+	{
+		name: "Bare import",
+		load: async () => await import(/* @vite-ignore */ PI_CODING_AGENT_MODULE),
 	},
 ];
 

@@ -3,6 +3,7 @@
 import { beforeEach, describe, expect, it, mock } from "bun:test";
 import {
 	clearCachedModule,
+	defaultLoaders,
 	loadDefaultPiSessionApi,
 	type ModuleLoader,
 } from "./pi-session-api";
@@ -51,6 +52,72 @@ describe("loadDefaultPiSessionApi", () => {
 		expect(Array.isArray(entries)).toBe(true);
 		expect(entries.length).toBeGreaterThan(0);
 	}, 30000);
+
+	describe("default loader order", () => {
+		it('first default loader is "Resolve from running Pi binary entry" (prefer the running Pi version)', () => {
+			const names = defaultLoaders.map((l) => l.name);
+			expect(names[0]).toBe("Resolve from running Pi binary entry");
+			expect(names).toContain("Bare import");
+		});
+
+		it("resolves through a bin-shim symlink when argv[1] is the shim path", async () => {
+			const {
+				mkdtempSync,
+				writeFileSync,
+				mkdirSync,
+				symlinkSync,
+				realpathSync,
+			} = await import("node:fs");
+			const { tmpdir } = await import("node:os");
+			const { join } = await import("node:path");
+
+			const dir = mkdtempSync(join(tmpdir(), "pi-symlink-test-"));
+			const pkgRoot = join(
+				dir,
+				"node_modules",
+				"@earendil-works",
+				"pi-coding-agent",
+			);
+			mkdirSync(pkgRoot, { recursive: true });
+			writeFileSync(
+				join(pkgRoot, "package.json"),
+				JSON.stringify({
+					name: "@earendil-works/pi-coding-agent",
+					version: "9.9.9",
+					exports: { ".": { import: "./index.js" } },
+				}),
+			);
+			writeFileSync(
+				join(pkgRoot, "index.js"),
+				`export const SessionManager = { listAll: async () => [] };\n`,
+			);
+			// bin shim: bin/pi -> <pkgRoot>/index.js (a symlink to the real entry)
+			const binDir = join(dir, "bin");
+			mkdirSync(binDir, { recursive: true });
+			const shim = join(binDir, "pi");
+			symlinkSync(join(pkgRoot, "index.js"), shim);
+
+			const origArgv = process.argv;
+			const origCwd = process.cwd();
+			try {
+				Object.defineProperty(process, "argv", {
+					value: [process.execPath, shim],
+					configurable: true,
+				});
+				process.chdir(dir);
+				clearCachedModule();
+				const api = await loadDefaultPiSessionApi();
+				expect(typeof api.listSessions).toBe("function");
+				expect(realpathSync(shim)).toBe(join(pkgRoot, "index.js"));
+			} finally {
+				Object.defineProperty(process, "argv", {
+					value: origArgv,
+					configurable: true,
+				});
+				process.chdir(origCwd);
+			}
+		}, 30000);
+	});
 
 	describe("resolution ladder mechanics", () => {
 		it("ladder order: first loader succeeds -> second never called", async () => {
