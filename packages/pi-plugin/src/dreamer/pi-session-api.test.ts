@@ -2,12 +2,73 @@
 
 import { beforeEach, describe, expect, it, mock } from "bun:test";
 import {
+	mkdirSync,
+	mkdtempSync,
+	realpathSync,
+	symlinkSync,
+	writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import {
 	clearCachedModule,
 	defaultLoaders,
 	loadDefaultPiSessionApi,
-	resolvePiCodingAgentModule,
 	type ModuleLoader,
+	resolvePiCodingAgentModule,
 } from "./pi-session-api";
+
+const PI_SPEC = "@earendil-works/pi-coding-agent";
+
+/** A fixture module whose listAll returns a unique marker, so tests can tell
+ * WHICH copy of pi-coding-agent was resolved through the public API. */
+function fixtureModule(marker: string): string {
+	return (
+		`export const __piShimFakeMarker = ${JSON.stringify(marker)};\n` +
+		`export const SessionManager = { listAll: async () => [${JSON.stringify(marker)}] };\n`
+	);
+}
+
+/** Write a fake pi-coding-agent package rooted at pkgRoot. */
+function writeFixturePackage(
+	pkgRoot: string,
+	opts: { version?: string; entry?: string; files: Record<string, string> },
+): void {
+	mkdirSync(pkgRoot, { recursive: true });
+	writeFileSync(
+		join(pkgRoot, "package.json"),
+		JSON.stringify({
+			name: PI_SPEC,
+			version: opts.version ?? "9.9.9",
+			exports: { ".": { import: opts.entry ?? "./index.js" } },
+		}),
+	);
+	for (const [rel, content] of Object.entries(opts.files)) {
+		const p = join(pkgRoot, rel);
+		mkdirSync(dirname(p), { recursive: true });
+		writeFileSync(p, content);
+	}
+}
+
+/** Run fn with process.argv[1] temporarily replaced (undefined = no script arg). */
+async function withArgv1<T>(
+	argv1: string | undefined,
+	fn: () => Promise<T>,
+): Promise<T> {
+	const origArgv = process.argv;
+	Object.defineProperty(process, "argv", {
+		value: argv1 === undefined ? [process.execPath] : [process.execPath, argv1],
+		configurable: true,
+	});
+	try {
+		return await fn();
+	} finally {
+		Object.defineProperty(process, "argv", {
+			value: origArgv,
+			configurable: true,
+		});
+	}
+}
 
 /**
  * These tests exercise the DEFAULT resolution path against the actually
@@ -32,9 +93,6 @@ describe("loadDefaultPiSessionApi", () => {
 
 	it("parses JSONL session entries through the resolved loader", async () => {
 		const api = await loadDefaultPiSessionApi();
-		const { mkdtempSync, writeFileSync } = await import("node:fs");
-		const { tmpdir } = await import("node:os");
-		const { join } = await import("node:path");
 
 		const dir = mkdtempSync(join(tmpdir(), "pi-session-api-test-"));
 		const file = join(dir, "session.jsonl");
@@ -62,16 +120,6 @@ describe("loadDefaultPiSessionApi", () => {
 		});
 
 		it("resolves through a bin-shim symlink when argv[1] is the shim path", async () => {
-			const {
-				mkdtempSync,
-				writeFileSync,
-				mkdirSync,
-				symlinkSync,
-				realpathSync,
-			} = await import("node:fs");
-			const { tmpdir } = await import("node:os");
-			const { join } = await import("node:path");
-
 			const dir = mkdtempSync(join(tmpdir(), "pi-symlink-test-"));
 			const pkgRoot = join(
 				dir,
@@ -79,57 +127,169 @@ describe("loadDefaultPiSessionApi", () => {
 				"@earendil-works",
 				"pi-coding-agent",
 			);
-			mkdirSync(pkgRoot, { recursive: true });
-			writeFileSync(
-				join(pkgRoot, "package.json"),
-				JSON.stringify({
-					name: "@earendil-works/pi-coding-agent",
-					version: "9.9.9",
-					exports: { ".": { import: "./index.js" } },
-				}),
-			);
-			writeFileSync(
-				join(pkgRoot, "index.js"),
-				`export const __piShimFakeMarker = "fake-9.9.9";\n` +
-					`export const SessionManager = { listAll: async () => [] };\n`,
-			);
+			writeFixturePackage(pkgRoot, {
+				files: { "index.js": fixtureModule("fake-9.9.9") },
+			});
 			// bin shim: bin/pi -> <pkgRoot>/index.js (a symlink to the real entry)
 			const binDir = join(dir, "bin");
 			mkdirSync(binDir, { recursive: true });
 			const shim = join(binDir, "pi");
 			symlinkSync(join(pkgRoot, "index.js"), shim);
 
-			const origArgv = process.argv;
 			const origCwd = process.cwd();
 			try {
-				Object.defineProperty(process, "argv", {
-					value: [process.execPath, shim],
-					configurable: true,
-				});
 				process.chdir(dir);
-				clearCachedModule();
-				const api = await loadDefaultPiSessionApi();
-				expect(typeof api.listSessions).toBe("function");
-				expect(typeof api.loadEntriesFromFile).toBe("function");
-				// The fake copy exports a marker the real installed pi-coding-agent
-				// does not. Asserting it proves the symlink walk actually resolved
-				// the fake copy: if the walk broke, resolvePiCodingAgentModule would
-				// silently fall back to the installed package (whose listAll is also
-				// a function) and the function checks above would still pass — the
-				// exact regression this test guards against. The marker makes that
-				// fallback fail loudly instead.
-				const mod = (await resolvePiCodingAgentModule(defaultLoaders)) as {
-					__piShimFakeMarker?: string;
-				};
-				expect(mod.__piShimFakeMarker).toBe("fake-9.9.9");
+				await withArgv1(shim, async () => {
+					clearCachedModule();
+					const api = await loadDefaultPiSessionApi();
+					expect(typeof api.listSessions).toBe("function");
+					expect(typeof api.loadEntriesFromFile).toBe("function");
+					// End-to-end through the PUBLIC resolve path: the fixture's
+					// listAll marker must come back. If the symlink walk broke and
+					// the bare-import fallback rescued resolution, the REAL
+					// installed package's sessions would come back instead and
+					// this assertion fails — the fallback cannot green this test.
+					expect(await api.listSessions()).toEqual(["fake-9.9.9"]);
+					// Belt and braces: the fake copy also exports a module marker
+					// the real installed pi-coding-agent does not.
+					const mod = (await resolvePiCodingAgentModule(defaultLoaders)) as {
+						__piShimFakeMarker?: string;
+					};
+					expect(mod.__piShimFakeMarker).toBe("fake-9.9.9");
+				});
 				expect(realpathSync(shim)).toBe(join(pkgRoot, "index.js"));
 			} finally {
-				Object.defineProperty(process, "argv", {
-					value: origArgv,
-					configurable: true,
-				});
 				process.chdir(origCwd);
 			}
+		}, 30000);
+	});
+
+	describe("running-Pi resolver layouts", () => {
+		it("prefers the running Pi over a stale extension-tree copy", async () => {
+			const dir = mkdtempSync(join(tmpdir(), "pi-running-vs-stale-"));
+			const pkgRoot = join(
+				dir,
+				"node_modules",
+				"@earendil-works",
+				"pi-coding-agent",
+			);
+			writeFixturePackage(pkgRoot, {
+				files: { "index.js": fixtureModule("running-pi-9.9.9") },
+			});
+
+			// The bare import resolves a STALE extension-tree copy. mock.module
+			// makes that copy observable: if the running-Pi resolver breaks and
+			// the bare import rescues resolution, the stale marker comes back
+			// and this test fails instead of greening on the fallback.
+			const originalModule = await import(PI_SPEC);
+			mock.module(PI_SPEC, () => ({
+				SessionManager: { listAll: async () => ["stale-extension-tree-copy"] },
+			}));
+			try {
+				await withArgv1(join(pkgRoot, "index.js"), async () => {
+					clearCachedModule();
+					const api = await loadDefaultPiSessionApi();
+					expect(await api.listSessions()).toEqual(["running-pi-9.9.9"]);
+				});
+			} finally {
+				mock.module(PI_SPEC, () => originalModule);
+				clearCachedModule();
+			}
+		}, 30000);
+
+		it("skips Pi's copied dist/package.json and resolves the parent package root", async () => {
+			const dir = mkdtempSync(join(tmpdir(), "pi-dist-metadata-"));
+			const pkgRoot = join(dir, "pi-coding-agent");
+			writeFixturePackage(pkgRoot, {
+				entry: "./dist/index.js",
+				files: {
+					"dist/index.js": fixtureModule("parent-root-9.9.9"),
+					"dist/cli.js": "// binary entry\n",
+					// build:binary copies this metadata into dist/. Stopping the
+					// walk here would resolve ./dist/index.js against dist/ and
+					// construct dist/dist/index.js.
+					"dist/package.json": JSON.stringify({
+						name: PI_SPEC,
+						version: "9.9.9",
+						exports: { ".": { import: "./dist/index.js" } },
+					}),
+				},
+			});
+			await withArgv1(join(pkgRoot, "dist", "cli.js"), async () => {
+				clearCachedModule();
+				const api = await loadDefaultPiSessionApi();
+				expect(await api.listSessions()).toEqual(["parent-root-9.9.9"]);
+			});
+		}, 30000);
+
+		it("rejects a manifest entry that escapes the package root", async () => {
+			const dir = mkdtempSync(join(tmpdir(), "pi-traversal-"));
+			const pkgRoot = join(dir, "pi-coding-agent");
+			writeFixturePackage(pkgRoot, {
+				entry: "../../outside.js",
+				files: { "cli.js": "// entry\n" },
+			});
+			await withArgv1(join(pkgRoot, "cli.js"), async () => {
+				clearCachedModule();
+				const fallback: ModuleLoader = {
+					name: "Fallback",
+					load: async () => ({
+						SessionManager: { listAll: async () => ["fallback-used"] },
+					}),
+				};
+				// The escaping entry must be rejected, falling through to the
+				// next loader rather than importing a path outside the package.
+				const api = await loadDefaultPiSessionApi([
+					defaultLoaders[0],
+					fallback,
+				]);
+				expect(await api.listSessions()).toEqual(["fallback-used"]);
+			});
+		}, 30000);
+
+		it("running from a TypeScript source checkout loads the source entry, not stale dist output", async () => {
+			const dir = mkdtempSync(join(tmpdir(), "pi-source-mode-"));
+			const pkgRoot = join(dir, "pi-coding-agent");
+			writeFixturePackage(pkgRoot, {
+				entry: "./dist/index.js",
+				files: {
+					"src/cli.ts": "// source entry (tsx/jiti)\n",
+					"src/index.ts": fixtureModule("source-checkout"),
+					// Stale build output left behind by an old build — must NOT win.
+					"dist/index.js": fixtureModule("stale-dist-output"),
+				},
+			});
+			await withArgv1(join(pkgRoot, "src", "cli.ts"), async () => {
+				clearCachedModule();
+				const api = await loadDefaultPiSessionApi();
+				expect(await api.listSessions()).toEqual(["source-checkout"]);
+			});
+		}, 30000);
+
+		it("source mode without a source counterpart falls through instead of loading stale dist", async () => {
+			const dir = mkdtempSync(join(tmpdir(), "pi-source-missing-"));
+			const pkgRoot = join(dir, "pi-coding-agent");
+			writeFixturePackage(pkgRoot, {
+				entry: "./dist/index.js",
+				files: {
+					"src/cli.ts": "// source entry (tsx/jiti)\n",
+					"dist/index.js": fixtureModule("stale-dist-output"),
+				},
+			});
+			await withArgv1(join(pkgRoot, "src", "cli.ts"), async () => {
+				clearCachedModule();
+				const fallback: ModuleLoader = {
+					name: "Fallback",
+					load: async () => ({
+						SessionManager: { listAll: async () => ["fallback-used"] },
+					}),
+				};
+				const api = await loadDefaultPiSessionApi([
+					defaultLoaders[0],
+					fallback,
+				]);
+				expect(await api.listSessions()).toEqual(["fallback-used"]);
+			});
 		}, 30000);
 	});
 
@@ -206,16 +366,11 @@ describe("loadDefaultPiSessionApi", () => {
 		});
 
 		it("missing argv[1] names the walked entry (execPath) in the error, not undefined", async () => {
-			const origArgv = process.argv;
-			try {
-				// Packaged-binary run: argv has no script path, so the loader falls
-				// back to process.execPath; the upward walk cannot find
-				// pi-coding-agent from there, and the error must name the path
-				// actually walked rather than interpolating `undefined`.
-				Object.defineProperty(process, "argv", {
-					value: [process.execPath],
-					configurable: true,
-				});
+			// Packaged-binary run: argv has no script path, so the loader falls
+			// back to process.execPath; the upward walk cannot find
+			// pi-coding-agent from there, and the error must name the path
+			// actually walked rather than interpolating `undefined`.
+			await withArgv1(undefined, async () => {
 				const loaders: ModuleLoader[] = [defaultLoaders[0]];
 				let error: Error | null = null;
 				try {
@@ -229,12 +384,7 @@ describe("loadDefaultPiSessionApi", () => {
 				);
 				expect(error?.message).toContain(process.execPath);
 				expect(error?.message).not.toContain("from undefined");
-			} finally {
-				Object.defineProperty(process, "argv", {
-					value: origArgv,
-					configurable: true,
-				});
-			}
+			});
 		});
 
 		it("memoization: two calls -> loaders invoked once", async () => {
